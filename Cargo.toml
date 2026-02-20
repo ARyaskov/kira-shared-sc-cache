@@ -1,0 +1,25 @@
+[package]
+name = "kira-shared-sc-cache"
+description = "Shared deterministic binary cache reader/writer for Kira single-cell pipelines (kira-organelle.bin and expr.bin)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/ARyaskov/kira-shared-sc-cache"
+keywords = [
+    "bioinformatics",
+    "single-cell",
+    "cache",
+    "mmap",
+    "pipeline"
+]
+categories = [
+    "science",
+    "science::bioinformatics",
+    "command-line-utilities",
+    "algorithms"
+]
+
+[dependencies]
+memmap2 = "0.9"
+thiserror = "2.0"
