@@ -1,7 +1,7 @@
 [package]
 name = "kira-shared-sc-cache"
 description = "Shared deterministic binary cache reader/writer for Kira single-cell pipelines (kira-organelle.bin and expr.bin)."
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
