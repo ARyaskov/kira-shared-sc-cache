@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
@@ -12,6 +12,10 @@ const VERSION_MAJOR: u16 = 1;
 const VERSION_MINOR: u16 = 0;
 const ENDIAN_TAG: u32 = 0x1234_5678;
 const CRC64_ECMA_POLY: u64 = 0x42F0_E1EB_A9EA_3693;
+
+/// 1 MiB write buffer — amortises syscalls for the CSC payload, which
+/// dominates the file size on real datasets.
+const WRITE_BUF: usize = 1 << 20;
 
 #[derive(Debug, Error)]
 pub enum SharedCacheError {
@@ -41,18 +45,35 @@ impl SharedCacheMmap {
     pub fn col_ptr(&self) -> &[u64] {
         let len = self.n_cells + 1;
         let bytes = &self.mmap[self.col_ptr_offset..self.col_ptr_offset + len * 8];
-        // SAFETY: validated section bounds in mmap_shared_cache.
+        debug_assert_eq!(
+            (bytes.as_ptr() as usize) % std::mem::align_of::<u64>(),
+            0,
+            "col_ptr section must be u64-aligned (file format guarantees 64-byte section alignment)"
+        );
+        // SAFETY: validated section bounds in mmap_shared_cache; the file
+        // format enforces 64-byte section alignment, which is a multiple of
+        // align_of::<u64>() = 8.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, len) }
     }
 
     pub fn row_idx(&self) -> &[u32] {
         let bytes = &self.mmap[self.row_idx_offset..self.row_idx_offset + self.nnz * 4];
+        debug_assert_eq!(
+            (bytes.as_ptr() as usize) % std::mem::align_of::<u32>(),
+            0,
+            "row_idx section must be u32-aligned"
+        );
         // SAFETY: validated section bounds in mmap_shared_cache.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, self.nnz) }
     }
 
     pub fn values_u32(&self) -> &[u32] {
         let bytes = &self.mmap[self.values_u32_offset..self.values_u32_offset + self.nnz * 4];
+        debug_assert_eq!(
+            (bytes.as_ptr() as usize) % std::mem::align_of::<u32>(),
+            0,
+            "values_u32 section must be u32-aligned"
+        );
         // SAFETY: validated section bounds in mmap_shared_cache.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, self.nnz) }
     }
@@ -121,21 +142,27 @@ pub fn mmap_shared_cache(path: &Path) -> Result<SharedCacheMmap, SharedCacheErro
             source,
         })?
     };
+    // The cache is always consumed front-to-back (string tables, then CSC
+    // arrays), so hint the kernel to read ahead. No-op on non-Unix targets.
+    #[cfg(unix)]
+    {
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+    }
 
     let header = &mmap[..HEADER_SIZE];
     validate_header(path, header, metadata.len() as usize)?;
 
-    let n_genes = read_u64(header, 16)? as usize;
-    let n_cells = read_u64(header, 24)? as usize;
-    let nnz = read_u64(header, 32)? as usize;
+    let n_genes = read_u64(header, 16) as usize;
+    let n_cells = read_u64(header, 24) as usize;
+    let nnz = read_u64(header, 32) as usize;
 
-    let genes_table_offset = read_u64(header, 40)? as usize;
-    let genes_table_bytes = read_u64(header, 48)? as usize;
-    let barcodes_table_offset = read_u64(header, 56)? as usize;
-    let barcodes_table_bytes = read_u64(header, 64)? as usize;
-    let col_ptr_offset = read_u64(header, 72)? as usize;
-    let row_idx_offset = read_u64(header, 80)? as usize;
-    let values_u32_offset = read_u64(header, 88)? as usize;
+    let genes_table_offset = read_u64(header, 40) as usize;
+    let genes_table_bytes = read_u64(header, 48) as usize;
+    let barcodes_table_offset = read_u64(header, 56) as usize;
+    let barcodes_table_bytes = read_u64(header, 64) as usize;
+    let col_ptr_offset = read_u64(header, 72) as usize;
+    let row_idx_offset = read_u64(header, 80) as usize;
+    let values_u32_offset = read_u64(header, 88) as usize;
 
     let genes = parse_string_table(
         path,
@@ -212,13 +239,13 @@ pub fn write_shared_cache(
     let genes_table = encode_string_table(path, input.genes)?;
     let barcodes_table = encode_string_table(path, input.barcodes)?;
 
-    let genes_table_offset = align_to(HEADER_SIZE, ALIGNMENT);
-    let barcodes_table_offset = align_to(genes_table_offset + genes_table.len(), ALIGNMENT);
-    let col_ptr_offset = align_to(barcodes_table_offset + barcodes_table.len(), ALIGNMENT);
+    let genes_table_offset = HEADER_SIZE.next_multiple_of(ALIGNMENT);
+    let barcodes_table_offset = (genes_table_offset + genes_table.len()).next_multiple_of(ALIGNMENT);
+    let col_ptr_offset = (barcodes_table_offset + barcodes_table.len()).next_multiple_of(ALIGNMENT);
     let col_ptr_bytes = input.col_ptr.len() * 8;
-    let row_idx_offset = align_to(col_ptr_offset + col_ptr_bytes, ALIGNMENT);
+    let row_idx_offset = (col_ptr_offset + col_ptr_bytes).next_multiple_of(ALIGNMENT);
     let row_idx_bytes = input.row_idx.len() * 4;
-    let values_u32_offset = align_to(row_idx_offset + row_idx_bytes, ALIGNMENT);
+    let values_u32_offset = (row_idx_offset + row_idx_bytes).next_multiple_of(ALIGNMENT);
     let values_u32_bytes = input.values_u32.len() * 4;
     let file_bytes = values_u32_offset + values_u32_bytes;
 
@@ -245,7 +272,7 @@ pub fn write_shared_cache(
     let crc = crc64_ecma(&header);
     write_u64(&mut header, 120, crc);
 
-    let mut file = File::create(path).map_err(|source| SharedCacheError::Io {
+    let file = File::create(path).map_err(|source| SharedCacheError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -254,15 +281,23 @@ pub fn write_shared_cache(
             path: path.to_path_buf(),
             source,
         })?;
+    let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
 
-    write_at(&mut file, 0, &header, path)?;
-    write_at(&mut file, genes_table_offset, &genes_table, path)?;
-    write_at(&mut file, barcodes_table_offset, &barcodes_table, path)?;
+    write_at(&mut writer, 0, &header, path)?;
+    write_at(&mut writer, genes_table_offset, &genes_table, path)?;
+    write_at(&mut writer, barcodes_table_offset, &barcodes_table, path)?;
 
-    write_u64_slice(&mut file, col_ptr_offset, input.col_ptr, path)?;
-    write_u32_slice(&mut file, row_idx_offset, input.row_idx, path)?;
-    write_u32_slice(&mut file, values_u32_offset, input.values_u32, path)?;
+    // Zero-copy: reinterpret the u64/u32 slices as bytes and hand them to
+    // the BufWriter directly. Avoids the previous N-byte intermediate Vec
+    // per section (could be 100s of MB for typical NNZ).
+    write_slice_le::<u64>(&mut writer, col_ptr_offset, input.col_ptr, path)?;
+    write_slice_le::<u32>(&mut writer, row_idx_offset, input.row_idx, path)?;
+    write_slice_le::<u32>(&mut writer, values_u32_offset, input.values_u32, path)?;
 
+    let file = writer.into_inner().map_err(|err| SharedCacheError::Io {
+        path: path.to_path_buf(),
+        source: err.into_error(),
+    })?;
     file.sync_all().map_err(|source| SharedCacheError::Io {
         path: path.to_path_buf(),
         source,
@@ -276,27 +311,27 @@ fn validate_header(path: &Path, header: &[u8], file_len: usize) -> Result<(), Sh
         return Err(format_error(path, "invalid magic"));
     }
 
-    if read_u16(header, 4)? != VERSION_MAJOR {
+    if read_u16(header, 4) != VERSION_MAJOR {
         return Err(format_error(path, "unsupported major version"));
     }
-    if read_u16(header, 6)? != VERSION_MINOR {
+    if read_u16(header, 6) != VERSION_MINOR {
         return Err(format_error(path, "unsupported minor version"));
     }
-    if read_u32(header, 8)? != ENDIAN_TAG {
+    if read_u32(header, 8) != ENDIAN_TAG {
         return Err(format_error(path, "invalid endian tag"));
     }
-    if read_u32(header, 12)? as usize != HEADER_SIZE {
+    if read_u32(header, 12) as usize != HEADER_SIZE {
         return Err(format_error(path, "unsupported header size"));
     }
 
-    let file_bytes = read_u64(header, 112)? as usize;
+    let file_bytes = read_u64(header, 112) as usize;
     if file_bytes != file_len {
         return Err(format_error(path, "file_bytes mismatch"));
     }
 
-    let n_blocks = read_u64(header, 96)?;
-    let blocks_offset = read_u64(header, 104)?;
-    let data_crc64 = read_u64(header, 128)?;
+    let n_blocks = read_u64(header, 96);
+    let blocks_offset = read_u64(header, 104);
+    let data_crc64 = read_u64(header, 128);
     if n_blocks != 0 || blocks_offset != 0 || data_crc64 != 0 {
         return Err(format_error(
             path,
@@ -304,20 +339,23 @@ fn validate_header(path: &Path, header: &[u8], file_len: usize) -> Result<(), Sh
         ));
     }
 
-    let mut crc_header = header.to_vec();
+    // Verify header_crc64 with the field itself blanked out. Building the
+    // scratch buffer on the stack avoids a Vec alloc on every read.
+    let expected_crc = read_u64(header, 120);
+    let mut crc_header = [0u8; HEADER_SIZE];
+    crc_header.copy_from_slice(header);
     crc_header[120..128].fill(0);
-    let expected_crc = read_u64(header, 120)?;
     let actual_crc = crc64_ecma(&crc_header);
     if actual_crc != expected_crc {
         return Err(format_error(path, "header_crc64 mismatch"));
     }
 
     for offset in [
-        read_u64(header, 40)? as usize,
-        read_u64(header, 56)? as usize,
-        read_u64(header, 72)? as usize,
-        read_u64(header, 80)? as usize,
-        read_u64(header, 88)? as usize,
+        read_u64(header, 40) as usize,
+        read_u64(header, 56) as usize,
+        read_u64(header, 72) as usize,
+        read_u64(header, 80) as usize,
+        read_u64(header, 88) as usize,
     ] {
         if offset % ALIGNMENT != 0 {
             return Err(format_error(path, "section offset is not 64-byte aligned"));
@@ -392,7 +430,7 @@ fn parse_string_table(
         return Err(format_error(path, &format!("{field_name} table too small")));
     }
 
-    let count = read_u32(table, 0)? as usize;
+    let count = read_u32(table, 0) as usize;
     if count != expected_count {
         return Err(format_error(
             path,
@@ -411,7 +449,7 @@ fn parse_string_table(
         ));
     }
 
-    let blob_len = read_u32(table, 4 + count * 4)? as usize;
+    let blob_len = read_u32(table, 4 + count * 4) as usize;
     if blob_offset + blob_len != table.len() {
         return Err(format_error(
             path,
@@ -421,8 +459,8 @@ fn parse_string_table(
 
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let start = read_u32(table, 4 + i * 4)? as usize;
-        let end = read_u32(table, 4 + (i + 1) * 4)? as usize;
+        let start = read_u32(table, 4 + i * 4) as usize;
+        let end = read_u32(table, 4 + (i + 1) * 4) as usize;
         if start > end || end > blob_len {
             return Err(format_error(
                 path,
@@ -438,19 +476,20 @@ fn parse_string_table(
 }
 
 fn encode_string_table(path: &Path, strings: &[String]) -> Result<Vec<u8>, SharedCacheError> {
-    let mut offsets = Vec::with_capacity(strings.len() + 1);
-    offsets.push(0u32);
+    // Pre-size: 4 bytes (count) + (N+1)*4 (offsets) + total UTF-8 bytes.
+    let total_bytes: usize = strings.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(4 + (strings.len() + 1) * 4 + total_bytes);
+    out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
 
-    let mut blob = Vec::new();
+    let mut blob: Vec<u8> = Vec::with_capacity(total_bytes);
+    let mut offsets: Vec<u32> = Vec::with_capacity(strings.len() + 1);
+    offsets.push(0);
     for s in strings {
         blob.extend_from_slice(s.as_bytes());
         let next = u32::try_from(blob.len())
             .map_err(|_| format_error(path, "string table exceeds u32 range"))?;
         offsets.push(next);
     }
-
-    let mut out = Vec::with_capacity(4 + offsets.len() * 4 + blob.len());
-    out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
     for off in offsets {
         out.extend_from_slice(&off.to_le_bytes());
     }
@@ -478,81 +517,91 @@ fn check_range(
     Ok(())
 }
 
-fn write_at(
-    file: &mut File,
+fn write_at<W: Write + Seek>(
+    writer: &mut W,
     offset: usize,
     data: &[u8],
     path: &Path,
 ) -> Result<(), SharedCacheError> {
-    file.seek(SeekFrom::Start(offset as u64))
+    writer
+        .seek(SeekFrom::Start(offset as u64))
         .map_err(|source| SharedCacheError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-    file.write_all(data).map_err(|source| SharedCacheError::Io {
+    writer.write_all(data).map_err(|source| SharedCacheError::Io {
         path: path.to_path_buf(),
         source,
     })
 }
 
-fn write_u64_slice(
-    file: &mut File,
+/// Marker trait for plain-old-data primitives we can write byte-by-byte.
+///
+/// SAFETY: implementors must be `#[repr(transparent)]` over a primitive that
+/// has a defined little-endian byte layout matching the file format.
+trait LeBytes {}
+impl LeBytes for u32 {}
+impl LeBytes for u64 {}
+
+/// Write a `[T]` slice as little-endian bytes without allocating an
+/// intermediate byte buffer.
+///
+/// On little-endian targets (the only ones we currently support — the file
+/// format includes an `endian_tag` check on read) the slice already has the
+/// correct byte order, so a single `write_all` is enough.
+fn write_slice_le<T: LeBytes>(
+    writer: &mut BufWriter<File>,
     offset: usize,
-    data: &[u64],
+    data: &[T],
     path: &Path,
 ) -> Result<(), SharedCacheError> {
-    let mut buf = Vec::with_capacity(data.len() * 8);
-    for &v in data {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    write_at(file, offset, &buf, path)
+    // Compile-time assertion that the host is LE. memmap2 + this crate are
+    // both LE-only by spec.
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("kira-shared-sc-cache requires a little-endian host (see CACHE_FILE.md)");
+
+    let byte_len = std::mem::size_of_val(data);
+    // SAFETY: `T: LeBytes` is implemented only for u32/u64, both plain old
+    // data with a stable bit pattern. We borrow the slice as bytes and never
+    // outlive `data`.
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+    write_at(writer, offset, bytes, path)
 }
 
-fn write_u32_slice(
-    file: &mut File,
-    offset: usize,
-    data: &[u32],
-    path: &Path,
-) -> Result<(), SharedCacheError> {
-    let mut buf = Vec::with_capacity(data.len() * 4);
-    for &v in data {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    write_at(file, offset, &buf, path)
-}
-
-fn align_to(value: usize, align: usize) -> usize {
-    ((value + align - 1) / align) * align
-}
-
+#[inline]
 fn write_u16(header: &mut [u8], offset: usize, value: u16) {
     header[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+#[inline]
 fn write_u32(header: &mut [u8], offset: usize, value: u32) {
     header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+#[inline]
 fn write_u64(header: &mut [u8], offset: usize, value: u64) {
     header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn read_u16(buf: &[u8], offset: usize) -> Result<u16, SharedCacheError> {
+#[inline]
+fn read_u16(buf: &[u8], offset: usize) -> u16 {
     let mut arr = [0u8; 2];
     arr.copy_from_slice(&buf[offset..offset + 2]);
-    Ok(u16::from_le_bytes(arr))
+    u16::from_le_bytes(arr)
 }
 
-fn read_u32(buf: &[u8], offset: usize) -> Result<u32, SharedCacheError> {
+#[inline]
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
     let mut arr = [0u8; 4];
     arr.copy_from_slice(&buf[offset..offset + 4]);
-    Ok(u32::from_le_bytes(arr))
+    u32::from_le_bytes(arr)
 }
 
-fn read_u64(buf: &[u8], offset: usize) -> Result<u64, SharedCacheError> {
+#[inline]
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(&buf[offset..offset + 8]);
-    Ok(u64::from_le_bytes(arr))
+    u64::from_le_bytes(arr)
 }
 
 fn format_error(path: &Path, message: &str) -> SharedCacheError {
@@ -562,7 +611,51 @@ fn format_error(path: &Path, message: &str) -> SharedCacheError {
     }
 }
 
+// ─────────────────────────── CRC64-ECMA ───────────────────────────
+
+/// Precomputed CRC64-ECMA lookup table (one byte at a time).
+///
+/// Built once on first use via `OnceLock`. The bit-by-bit reference path is
+/// kept in `bitwise_crc64_ecma` for tests so the two implementations can be
+/// cross-validated.
+static CRC_TABLE: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
+
+fn crc_table() -> &'static [u64; 256] {
+    CRC_TABLE.get_or_init(|| {
+        let mut table = [0u64; 256];
+        let mut byte = 0usize;
+        while byte < 256 {
+            let mut crc = (byte as u64) << 56;
+            let mut bit = 0;
+            while bit < 8 {
+                if crc & 0x8000_0000_0000_0000 != 0 {
+                    crc = (crc << 1) ^ CRC64_ECMA_POLY;
+                } else {
+                    crc <<= 1;
+                }
+                bit += 1;
+            }
+            table[byte] = crc;
+            byte += 1;
+        }
+        table
+    })
+}
+
+/// CRC64-ECMA, table-driven. Polynomial = 0x42F0_E1EB_A9EA_3693, initial = 0,
+/// no reflection, no final XOR.
 pub fn crc64_ecma(bytes: &[u8]) -> u64 {
+    let table = crc_table();
+    let mut crc = 0u64;
+    for &b in bytes {
+        let idx = ((crc >> 56) as u8) ^ b;
+        crc = (crc << 8) ^ table[idx as usize];
+    }
+    crc
+}
+
+#[cfg(test)]
+fn bitwise_crc64_ecma(bytes: &[u8]) -> u64 {
     let mut crc = 0u64;
     for &byte in bytes {
         crc ^= (byte as u64) << 56;
@@ -575,4 +668,23 @@ pub fn crc64_ecma(bytes: &[u8]) -> u64 {
         }
     }
     crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc64_table_matches_bitwise() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"x",
+            b"123456789",
+            b"The quick brown fox jumps over the lazy dog",
+            &[0u8; 256],
+        ];
+        for s in samples {
+            assert_eq!(crc64_ecma(s), bitwise_crc64_ecma(s), "input={s:?}");
+        }
+    }
 }

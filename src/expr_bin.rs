@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
@@ -9,6 +9,10 @@ const MAGIC: &[u8; 8] = b"KIRAMTX\0";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 24;
 const MODE_MASK: u32 = 0xFF;
+
+/// Buffer size for the writer. 1 MiB amortises syscalls when writing the
+/// dense `values` payload (which dominates the file).
+const WRITE_BUF: usize = 1 << 20;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ExprCacheMode {
@@ -68,13 +72,26 @@ pub struct ExprBinMmap {
 }
 
 impl ExprBinMmap {
+    /// View the dense expression buffer as `&[f32]` without copying.
+    ///
+    /// SAFETY contract: `HEADER_LEN = 24` is a multiple of `align_of::<f32>()`
+    /// (4), and the mmap base is page-aligned by the kernel, so the value
+    /// section is correctly aligned for `f32`. `mmap_expr_bin` validates that
+    /// the byte length exactly matches `genes * samples * 4`.
     pub fn values(&self) -> &[f32] {
         let values_len = self.genes * self.samples;
         let values_bytes = &self.mmap[HEADER_LEN..HEADER_LEN + values_len * 4];
-        // SAFETY: validated layout in mmap_expr_bin.
+        debug_assert_eq!(
+            (values_bytes.as_ptr() as usize) % std::mem::align_of::<f32>(),
+            0,
+            "values section must be f32-aligned"
+        );
+        // SAFETY: alignment is asserted, length matches the file-format
+        // invariant validated in `mmap_expr_bin`.
         unsafe { std::slice::from_raw_parts(values_bytes.as_ptr() as *const f32, values_len) }
     }
 
+    #[inline]
     pub fn get(&self, gene: usize, sample: usize) -> f32 {
         self.values()[gene * self.samples + sample]
     }
@@ -112,51 +129,44 @@ pub fn write_expr_bin_with_mode(
         });
     }
 
-    let mut file = File::create(path).map_err(|source| ExprBinError::Io {
+    let file = File::create(path).map_err(|source| ExprBinError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
 
-    file.write_all(MAGIC).map_err(|source| ExprBinError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(&VERSION.to_le_bytes())
-        .map_err(|source| ExprBinError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.write_all(&(genes as u32).to_le_bytes())
-        .map_err(|source| ExprBinError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.write_all(&(samples as u32).to_le_bytes())
-        .map_err(|source| ExprBinError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.write_all(&mode.to_flags().to_le_bytes())
-        .map_err(|source| ExprBinError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    // Header: 24 bytes built on the stack so the BufWriter sees one chunk.
+    let mut header = [0u8; HEADER_LEN];
+    header[..8].copy_from_slice(MAGIC);
+    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&(genes as u32).to_le_bytes());
+    header[16..20].copy_from_slice(&(samples as u32).to_le_bytes());
+    header[20..24].copy_from_slice(&mode.to_flags().to_le_bytes());
+    write_all(&mut writer, &header, path)?;
 
-    // SAFETY: f32 is plain old data; we only reinterpret contiguous bytes.
     let byte_len = values.len() * std::mem::size_of::<f32>();
+    // SAFETY: f32 is plain old data; we only reinterpret contiguous bytes.
     let value_bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
-    file.write_all(value_bytes)
-        .map_err(|source| ExprBinError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    write_all(&mut writer, value_bytes, path)?;
 
+    let file = writer.into_inner().map_err(|err| ExprBinError::Io {
+        path: path.to_path_buf(),
+        source: err.into_error(),
+    })?;
     file.sync_all().map_err(|source| ExprBinError::Io {
         path: path.to_path_buf(),
         source,
     })?;
 
     Ok(())
+}
+
+#[inline]
+fn write_all<W: Write>(w: &mut W, data: &[u8], path: &Path) -> Result<(), ExprBinError> {
+    w.write_all(data).map_err(|source| ExprBinError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn mmap_expr_bin(path: &Path) -> Result<ExprBinMmap, ExprBinError> {
@@ -180,6 +190,13 @@ pub fn mmap_expr_bin(path: &Path) -> Result<ExprBinMmap, ExprBinError> {
             source,
         })?
     };
+    // Hint the kernel to read ahead; we always scan the dense matrix
+    // sequentially in downstream tools. memmap2 only exposes `advise` on
+    // Unix — on other platforms the kernel uses its default heuristic.
+    #[cfg(unix)]
+    {
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+    }
 
     let header = &mmap[..HEADER_LEN];
     if &header[..8] != MAGIC {
@@ -188,7 +205,7 @@ pub fn mmap_expr_bin(path: &Path) -> Result<ExprBinMmap, ExprBinError> {
         });
     }
 
-    let version = read_u32(header, 8)?;
+    let version = read_u32(header, 8);
     if version != VERSION {
         return Err(ExprBinError::UnsupportedVersion {
             path: path.to_path_buf(),
@@ -196,9 +213,9 @@ pub fn mmap_expr_bin(path: &Path) -> Result<ExprBinMmap, ExprBinError> {
         });
     }
 
-    let genes = read_u32(header, 12)? as usize;
-    let samples = read_u32(header, 16)? as usize;
-    let mode = ExprCacheMode::from_flags(read_u32(header, 20)?);
+    let genes = read_u32(header, 12) as usize;
+    let samples = read_u32(header, 16) as usize;
+    let mode = ExprCacheMode::from_flags(read_u32(header, 20));
 
     let values_len = genes
         .checked_mul(samples)
@@ -226,8 +243,8 @@ pub fn mmap_expr_bin(path: &Path) -> Result<ExprBinMmap, ExprBinError> {
 }
 
 #[inline]
-fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ExprBinError> {
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
     let mut arr = [0u8; 4];
     arr.copy_from_slice(&buf[offset..offset + 4]);
-    Ok(u32::from_le_bytes(arr))
+    u32::from_le_bytes(arr)
 }
