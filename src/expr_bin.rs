@@ -10,8 +10,6 @@ const VERSION: u32 = 1;
 const HEADER_LEN: usize = 24;
 const MODE_MASK: u32 = 0xFF;
 
-/// Buffer size for the writer. 1 MiB amortises syscalls when writing the
-/// dense `values` payload (which dominates the file).
 const WRITE_BUF: usize = 1 << 20;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -72,22 +70,18 @@ pub struct ExprBinMmap {
 }
 
 impl ExprBinMmap {
-    /// View the dense expression buffer as `&[f32]` without copying.
+    /// View the dense expression buffer as `&[f32]`.
     ///
-    /// SAFETY contract: `HEADER_LEN = 24` is a multiple of `align_of::<f32>()`
-    /// (4), and the mmap base is page-aligned by the kernel, so the value
-    /// section is correctly aligned for `f32`. `mmap_expr_bin` validates that
-    /// the byte length exactly matches `genes * samples * 4`.
+    /// Safe because `HEADER_LEN` is a multiple of `align_of::<f32>()`, the
+    /// mmap base is page-aligned, and `mmap_expr_bin` validates the byte
+    /// length.
     pub fn values(&self) -> &[f32] {
         let values_len = self.genes * self.samples;
         let values_bytes = &self.mmap[HEADER_LEN..HEADER_LEN + values_len * 4];
         debug_assert_eq!(
             (values_bytes.as_ptr() as usize) % std::mem::align_of::<f32>(),
-            0,
-            "values section must be f32-aligned"
+            0
         );
-        // SAFETY: alignment is asserted, length matches the file-format
-        // invariant validated in `mmap_expr_bin`.
         unsafe { std::slice::from_raw_parts(values_bytes.as_ptr() as *const f32, values_len) }
     }
 
@@ -135,7 +129,6 @@ pub fn write_expr_bin_with_mode(
     })?;
     let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
 
-    // Header: 24 bytes built on the stack so the BufWriter sees one chunk.
     let mut header = [0u8; HEADER_LEN];
     header[..8].copy_from_slice(MAGIC);
     header[8..12].copy_from_slice(&VERSION.to_le_bytes());
@@ -145,7 +138,7 @@ pub fn write_expr_bin_with_mode(
     write_all(&mut writer, &header, path)?;
 
     let byte_len = values.len() * std::mem::size_of::<f32>();
-    // SAFETY: f32 is plain old data; we only reinterpret contiguous bytes.
+    // SAFETY: f32 is POD.
     let value_bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
     write_all(&mut writer, value_bytes, path)?;
 
@@ -190,9 +183,6 @@ pub fn mmap_expr_bin(path: &Path) -> Result<ExprBinMmap, ExprBinError> {
             source,
         })?
     };
-    // Hint the kernel to read ahead; we always scan the dense matrix
-    // sequentially in downstream tools. memmap2 only exposes `advise` on
-    // Unix — on other platforms the kernel uses its default heuristic.
     #[cfg(unix)]
     {
         let _ = mmap.advise(memmap2::Advice::Sequential);

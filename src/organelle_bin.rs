@@ -13,8 +13,6 @@ const VERSION_MINOR: u16 = 0;
 const ENDIAN_TAG: u32 = 0x1234_5678;
 const CRC64_ECMA_POLY: u64 = 0x42F0_E1EB_A9EA_3693;
 
-/// 1 MiB write buffer — amortises syscalls for the CSC payload, which
-/// dominates the file size on real datasets.
 const WRITE_BUF: usize = 1 << 20;
 
 #[derive(Debug, Error)]
@@ -45,36 +43,23 @@ impl SharedCacheMmap {
     pub fn col_ptr(&self) -> &[u64] {
         let len = self.n_cells + 1;
         let bytes = &self.mmap[self.col_ptr_offset..self.col_ptr_offset + len * 8];
-        debug_assert_eq!(
-            (bytes.as_ptr() as usize) % std::mem::align_of::<u64>(),
-            0,
-            "col_ptr section must be u64-aligned (file format guarantees 64-byte section alignment)"
-        );
-        // SAFETY: validated section bounds in mmap_shared_cache; the file
-        // format enforces 64-byte section alignment, which is a multiple of
-        // align_of::<u64>() = 8.
+        debug_assert_eq!((bytes.as_ptr() as usize) % std::mem::align_of::<u64>(), 0);
+        // SAFETY: 64-byte section alignment guarantees u64 alignment; bounds
+        // validated in mmap_shared_cache.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, len) }
     }
 
     pub fn row_idx(&self) -> &[u32] {
         let bytes = &self.mmap[self.row_idx_offset..self.row_idx_offset + self.nnz * 4];
-        debug_assert_eq!(
-            (bytes.as_ptr() as usize) % std::mem::align_of::<u32>(),
-            0,
-            "row_idx section must be u32-aligned"
-        );
-        // SAFETY: validated section bounds in mmap_shared_cache.
+        debug_assert_eq!((bytes.as_ptr() as usize) % std::mem::align_of::<u32>(), 0);
+        // SAFETY: see col_ptr.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, self.nnz) }
     }
 
     pub fn values_u32(&self) -> &[u32] {
         let bytes = &self.mmap[self.values_u32_offset..self.values_u32_offset + self.nnz * 4];
-        debug_assert_eq!(
-            (bytes.as_ptr() as usize) % std::mem::align_of::<u32>(),
-            0,
-            "values_u32 section must be u32-aligned"
-        );
-        // SAFETY: validated section bounds in mmap_shared_cache.
+        debug_assert_eq!((bytes.as_ptr() as usize) % std::mem::align_of::<u32>(), 0);
+        // SAFETY: see col_ptr.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, self.nnz) }
     }
 }
@@ -142,8 +127,6 @@ pub fn mmap_shared_cache(path: &Path) -> Result<SharedCacheMmap, SharedCacheErro
             source,
         })?
     };
-    // The cache is always consumed front-to-back (string tables, then CSC
-    // arrays), so hint the kernel to read ahead. No-op on non-Unix targets.
     #[cfg(unix)]
     {
         let _ = mmap.advise(memmap2::Advice::Sequential);
@@ -240,7 +223,8 @@ pub fn write_shared_cache(
     let barcodes_table = encode_string_table(path, input.barcodes)?;
 
     let genes_table_offset = HEADER_SIZE.next_multiple_of(ALIGNMENT);
-    let barcodes_table_offset = (genes_table_offset + genes_table.len()).next_multiple_of(ALIGNMENT);
+    let barcodes_table_offset =
+        (genes_table_offset + genes_table.len()).next_multiple_of(ALIGNMENT);
     let col_ptr_offset = (barcodes_table_offset + barcodes_table.len()).next_multiple_of(ALIGNMENT);
     let col_ptr_bytes = input.col_ptr.len() * 8;
     let row_idx_offset = (col_ptr_offset + col_ptr_bytes).next_multiple_of(ALIGNMENT);
@@ -287,9 +271,6 @@ pub fn write_shared_cache(
     write_at(&mut writer, genes_table_offset, &genes_table, path)?;
     write_at(&mut writer, barcodes_table_offset, &barcodes_table, path)?;
 
-    // Zero-copy: reinterpret the u64/u32 slices as bytes and hand them to
-    // the BufWriter directly. Avoids the previous N-byte intermediate Vec
-    // per section (could be 100s of MB for typical NNZ).
     write_slice_le::<u64>(&mut writer, col_ptr_offset, input.col_ptr, path)?;
     write_slice_le::<u32>(&mut writer, row_idx_offset, input.row_idx, path)?;
     write_slice_le::<u32>(&mut writer, values_u32_offset, input.values_u32, path)?;
@@ -339,14 +320,12 @@ fn validate_header(path: &Path, header: &[u8], file_len: usize) -> Result<(), Sh
         ));
     }
 
-    // Verify header_crc64 with the field itself blanked out. Building the
-    // scratch buffer on the stack avoids a Vec alloc on every read.
+    // Verify header_crc64 with that field zeroed.
     let expected_crc = read_u64(header, 120);
     let mut crc_header = [0u8; HEADER_SIZE];
     crc_header.copy_from_slice(header);
     crc_header[120..128].fill(0);
-    let actual_crc = crc64_ecma(&crc_header);
-    if actual_crc != expected_crc {
+    if crc64_ecma(&crc_header) != expected_crc {
         return Err(format_error(path, "header_crc64 mismatch"));
     }
 
@@ -476,7 +455,6 @@ fn parse_string_table(
 }
 
 fn encode_string_table(path: &Path, strings: &[String]) -> Result<Vec<u8>, SharedCacheError> {
-    // Pre-size: 4 bytes (count) + (N+1)*4 (offsets) + total UTF-8 bytes.
     let total_bytes: usize = strings.iter().map(|s| s.len()).sum();
     let mut out = Vec::with_capacity(4 + (strings.len() + 1) * 4 + total_bytes);
     out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
@@ -529,41 +507,31 @@ fn write_at<W: Write + Seek>(
             path: path.to_path_buf(),
             source,
         })?;
-    writer.write_all(data).map_err(|source| SharedCacheError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    writer
+        .write_all(data)
+        .map_err(|source| SharedCacheError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
-/// Marker trait for plain-old-data primitives we can write byte-by-byte.
-///
-/// SAFETY: implementors must be `#[repr(transparent)]` over a primitive that
-/// has a defined little-endian byte layout matching the file format.
+/// POD types that can be written as raw little-endian bytes.
 trait LeBytes {}
 impl LeBytes for u32 {}
 impl LeBytes for u64 {}
 
-/// Write a `[T]` slice as little-endian bytes without allocating an
-/// intermediate byte buffer.
-///
-/// On little-endian targets (the only ones we currently support — the file
-/// format includes an `endian_tag` check on read) the slice already has the
-/// correct byte order, so a single `write_all` is enough.
 fn write_slice_le<T: LeBytes>(
     writer: &mut BufWriter<File>,
     offset: usize,
     data: &[T],
     path: &Path,
 ) -> Result<(), SharedCacheError> {
-    // Compile-time assertion that the host is LE. memmap2 + this crate are
-    // both LE-only by spec.
     #[cfg(not(target_endian = "little"))]
     compile_error!("kira-shared-sc-cache requires a little-endian host (see CACHE_FILE.md)");
 
     let byte_len = std::mem::size_of_val(data);
-    // SAFETY: `T: LeBytes` is implemented only for u32/u64, both plain old
-    // data with a stable bit pattern. We borrow the slice as bytes and never
-    // outlive `data`.
+    // SAFETY: u32/u64 are POD; LE host means the bytes already match the
+    // on-disk layout.
     let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
     write_at(writer, offset, bytes, path)
 }
@@ -613,11 +581,6 @@ fn format_error(path: &Path, message: &str) -> SharedCacheError {
 
 // ─────────────────────────── CRC64-ECMA ───────────────────────────
 
-/// Precomputed CRC64-ECMA lookup table (one byte at a time).
-///
-/// Built once on first use via `OnceLock`. The bit-by-bit reference path is
-/// kept in `bitwise_crc64_ecma` for tests so the two implementations can be
-/// cross-validated.
 static CRC_TABLE: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
 
 fn crc_table() -> &'static [u64; 256] {
@@ -642,8 +605,7 @@ fn crc_table() -> &'static [u64; 256] {
     })
 }
 
-/// CRC64-ECMA, table-driven. Polynomial = 0x42F0_E1EB_A9EA_3693, initial = 0,
-/// no reflection, no final XOR.
+/// CRC64-ECMA: poly=0x42F0_E1EB_A9EA_3693, init=0, no reflection, no XOR-out.
 pub fn crc64_ecma(bytes: &[u8]) -> u64 {
     let table = crc_table();
     let mut crc = 0u64;
